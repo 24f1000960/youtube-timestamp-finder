@@ -1,6 +1,6 @@
 fastapi
-uvicorn[standard]
-yt-dlp
-google-genai
-python-multipart
+uvicorn
+requests
 python-dotenv
+youtube-transcript-api
+pydantic

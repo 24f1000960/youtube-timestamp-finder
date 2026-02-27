@@ -1,21 +1,17 @@
 import os
-import time
+import re
 import json
-import tempfile
+import requests
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
-import yt_dlp
-from google import genai
-from google.genai import types
-from dotenv import load_dotenv
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from youtube_transcript_api import YouTubeTranscriptApi
+from youtube_transcript_api._errors import TranscriptsDisabled, NoTranscriptFound
+from dotenv import load_dotenv
 
-# Load .env file for local dev; on Render, env vars come from the dashboard
 load_dotenv()
 
-# ---------- App setup ----------
 app = FastAPI()
-
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -24,159 +20,137 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-if not GEMINI_API_KEY:
-    raise RuntimeError("GEMINI_API_KEY environment variable is not set!")
+AI_API_TOKEN = os.getenv("AI_API_TOKEN")
+CHAT_URL = os.getenv("CHAT_URL")
 
-client = genai.Client(api_key=GEMINI_API_KEY)
 
-# ---------- Request / Response models ----------
 class AskRequest(BaseModel):
     video_url: str
     topic: str
+
 
 class AskResponse(BaseModel):
     timestamp: str
     video_url: str
     topic: str
 
-# ---------- Helper: Download audio only ----------
-def download_audio(video_url: str, output_path: str) -> str:
-    ydl_opts = {
-        "format": "bestaudio/best",
-        "outtmpl": output_path,
-        "postprocessors": [{
-            "key": "FFmpegExtractAudio",
-            "preferredcodec": "mp3",
-            "preferredquality": "128",
-        }],
-        "quiet": True,
-        "no_warnings": True,
-    }
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        ydl.download([video_url])
 
-    mp3_path = output_path + ".mp3"
-    if not os.path.exists(mp3_path):
-        raise FileNotFoundError(f"Audio file not found after download: {mp3_path}")
-    return mp3_path
+def extract_video_id(url: str) -> str:
+    match = re.search(r"(?:v=|\/)([0-9A-Za-z_-]{11}).*", url)
+    if not match:
+        raise HTTPException(status_code=400, detail="Invalid YouTube URL")
+    return match.group(1)
 
-# ---------- Helper: Upload to Gemini and wait until ACTIVE ----------
-def upload_and_wait(audio_path: str):
-    print(f"Uploading {audio_path} to Gemini Files API...")
-    uploaded_file = client.files.upload(
-        file=audio_path,
-        config=types.UploadFileConfig(mime_type="audio/mpeg")
+
+def seconds_to_hhmmss(seconds: float) -> str:
+    hours = int(seconds // 3600)
+    minutes = int((seconds % 3600) // 60)
+    secs = int(seconds % 60)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+
+def fix_timestamp_format(timestamp: str) -> str:
+    if not timestamp:
+        return "00:00:00"
+    parts = timestamp.strip().split(":")
+    if len(parts) == 2:
+        return "00:" + timestamp.strip()
+    elif len(parts) == 3:
+        return timestamp.strip()
+    return "00:00:00"
+
+
+def get_transcript(video_id: str) -> str:
+    fetched = YouTubeTranscriptApi().fetch(video_id)
+    transcript_list = fetched.to_raw_data()
+
+    formatted = ""
+    for item in transcript_list:
+        time_str = seconds_to_hhmmss(item["start"])
+        text = item["text"].replace("\n", " ")
+        formatted += f"[{time_str}] {text}\n"
+    return formatted
+
+
+def ask_gemini(transcript: str, topic: str) -> str:
+    user_prompt = (
+        "You are a precise timestamp finder. You will be given a video transcript "
+        "with timestamps in HH:MM:SS format.\n\n"
+        f'Find the FIRST moment where the speaker discusses: "{topic}"\n\n'
+        "Rules:\n"
+        "1. Look for the exact phrase OR its meaning/context\n"
+        "2. Return the timestamp of that EXACT moment\n"
+        "3. Do NOT return chapter starts unless the topic starts there\n"
+        "4. Timestamp MUST be in HH:MM:SS format\n"
+        "5. Return ONLY raw JSON, no markdown, no explanation\n\n"
+        f"Transcript:\n{transcript}\n\n"
+        'Return ONLY this JSON: {"timestamp": "HH:MM:SS"}'
     )
 
-    max_wait = 120
-    waited = 0
-    while uploaded_file.state.name != "ACTIVE":
-        if waited > max_wait:
-            raise TimeoutError("Gemini file upload took too long to become ACTIVE.")
-        print(f"  File state: {uploaded_file.state.name} — waiting...")
-        time.sleep(5)
-        waited += 5
-        uploaded_file = client.files.get(name=uploaded_file.name)
+    headers = {
+        "Authorization": f"Bearer {AI_API_TOKEN}",
+        "Content-Type": "application/json",
+    }
 
-    print("  File is ACTIVE!")
-    return uploaded_file
+    payload = {
+        "model": "google/gemini-2.0-flash-001",
+        "messages": [{"role": "user", "content": user_prompt}],
+        "temperature": 0.0,
+    }
 
-# ---------- Helper: Normalize timestamp to HH:MM:SS ----------
-def normalize_timestamp(ts: str) -> str:
-    ts = ts.strip()
-    parts = ts.split(":")
+    response = requests.post(CHAT_URL, headers=headers, json=payload, timeout=60)
+
+    if response.status_code != 200:
+        raise HTTPException(
+            status_code=500,
+            detail=f"AI API error: {response.text}"
+        )
+
+    raw = response.json()["choices"][0]["message"]["content"]
+
+    raw = raw.strip()
+    if raw.startswith("```"):
+        lines = raw.split("\n")
+        lines = [l for l in lines if not l.startswith("```")]
+        raw = "\n".join(lines).strip()
+
     try:
-        if len(parts) == 1:
-            total_sec = int(parts[0])
-            h = total_sec // 3600
-            m = (total_sec % 3600) // 60
-            s = total_sec % 60
-        elif len(parts) == 2:
-            m, s = int(parts[0]), int(parts[1])
-            h = 0
-        else:
-            h, m, s = int(parts[0]), int(parts[1]), int(parts[2])
-        return f"{h:02d}:{m:02d}:{s:02d}"
-    except Exception:
+        result = json.loads(raw)
+        return result.get("timestamp", "00:00:00")
+    except json.JSONDecodeError:
+        match = re.search(r"\d{2}:\d{2}:\d{2}", raw)
+        if match:
+            return match.group(0)
         return "00:00:00"
 
-# ---------- Main endpoint ----------
+
 @app.post("/ask", response_model=AskResponse)
-async def ask(request: AskRequest):
-    audio_path = None
-    gemini_file = None
+def ask(request: AskRequest):
+    video_id = extract_video_id(request.video_url)
 
     try:
-        # Step 1: Download audio to a temp file
-        with tempfile.NamedTemporaryFile(delete=False, suffix="") as tmp:
-            tmp_base = tmp.name
-
-        print(f"Downloading audio for: {request.video_url}")
-        audio_path = download_audio(request.video_url, tmp_base)
-        print(f"Audio saved to: {audio_path}")
-
-        # Step 2: Upload to Gemini Files API
-        gemini_file = upload_and_wait(audio_path)
-
-        # Step 3: Ask Gemini to find the timestamp
-        prompt = f"""
-You are analyzing an audio file. Find the FIRST moment when this topic is spoken or discussed.
-
-Topic to find: "{request.topic}"
-
-Return ONLY the timestamp in HH:MM:SS format (e.g. "00:05:47") of when this topic FIRST appears.
-- Always use 3 parts separated by colons: HH:MM:SS
-- 5 minutes 47 seconds = "00:05:47"
-- 1 hour 34 minutes 9 seconds = "01:34:09"
-"""
-
-        response = client.models.generate_content(
-            model="gemini-2.0-flash",
-            contents=[
-                types.Part.from_uri(file_uri=gemini_file.uri, mime_type="audio/mpeg"),
-                prompt
-            ],
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json",
-                response_schema={
-                    "type": "object",
-                    "properties": {
-                        "timestamp": {
-                            "type": "string",
-                            "description": "Timestamp in HH:MM:SS format"
-                        }
-                    },
-                    "required": ["timestamp"]
-                }
-            )
+        transcript = get_transcript(video_id)
+    except TranscriptsDisabled:
+        raise HTTPException(
+            status_code=400,
+            detail="Transcripts are disabled for this video."
         )
-
-        result = json.loads(response.text)
-        timestamp = normalize_timestamp(result.get("timestamp", "00:00:00"))
-
-        return AskResponse(
-            timestamp=timestamp,
-            video_url=request.video_url,
-            topic=request.topic
+    except NoTranscriptFound:
+        raise HTTPException(
+            status_code=400,
+            detail="No transcript found for this video."
         )
-
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(
+            status_code=400,
+            detail=f"Transcript error: {str(e)}"
+        )
 
-    finally:
-        # Step 4: Cleanup temp files
-        if audio_path and os.path.exists(audio_path):
-            os.remove(audio_path)
-            print(f"Cleaned up local file: {audio_path}")
-        if gemini_file:
-            try:
-                client.files.delete(name=gemini_file.name)
-                print(f"Deleted Gemini file: {gemini_file.name}")
-            except Exception:
-                pass
+    timestamp = ask_gemini(transcript, request.topic)
+    timestamp = fix_timestamp_format(timestamp)
 
-# ---------- Health check ----------
-@app.get("/")
-def root():
-    return {"status": "running", "endpoint": "POST /ask"}
+    return AskResponse(
+        timestamp=timestamp,
+        video_url=request.video_url,
+        topic=request.topic,
+    )
