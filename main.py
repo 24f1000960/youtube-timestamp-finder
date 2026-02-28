@@ -19,12 +19,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# AIpipe — OpenAI-compatible, supports gemini-1.5-pro
-client = OpenAI(
-    api_key=os.environ.get("AIPIPE_TOKEN"),
-    base_url="https://aipipe.org/openai/v1"
-)
-
 
 class AskRequest(BaseModel):
     video_url: str
@@ -38,6 +32,16 @@ class AskResponse(BaseModel):
 
 
 def find_timestamp(video_url: str, topic: str) -> str:
+    # Create client inside the function — missing env var = 500 error, not startup crash
+    token = os.environ.get("AIPIPE_TOKEN")
+    if not token:
+        raise RuntimeError("AIPIPE_TOKEN environment variable is not set on Render")
+
+    client = OpenAI(
+        api_key=token,
+        base_url="https://aipipe.org/openai/v1"
+    )
+
     prompt = f"""You are analyzing a YouTube video at this URL: {video_url}
 
 Find the FIRST moment in the video where the topic or phrase "{topic}" is spoken or discussed.
