@@ -1,10 +1,10 @@
 import os
 import json
+import re
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from google import genai
-from google.genai import types
+from openai import OpenAI
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -19,7 +19,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
+# AIpipe — OpenAI-compatible, supports gemini-1.5-pro
+client = OpenAI(
+    api_key=os.environ.get("AIPIPE_TOKEN"),
+    base_url="https://aipipe.org/openai/v1"
+)
 
 
 class AskRequest(BaseModel):
@@ -33,48 +37,32 @@ class AskResponse(BaseModel):
     topic: str
 
 
-def find_timestamp_with_gemini(video_url: str, topic: str) -> str:
-    """Pass the YouTube URL directly to Gemini and ask it to find the timestamp."""
-    prompt = f"""Watch this YouTube video and find the FIRST moment where the topic or phrase "{topic}" is spoken or discussed.
+def find_timestamp(video_url: str, topic: str) -> str:
+    prompt = f"""You are analyzing a YouTube video at this URL: {video_url}
 
-Return ONLY a JSON object in this exact format:
-{{"timestamp": "HH:MM:SS"}}
+Find the FIRST moment in the video where the topic or phrase "{topic}" is spoken or discussed.
+
+Respond ONLY with a valid JSON object like this:
+{{"timestamp": "00:05:47"}}
 
 Rules:
-- HH:MM:SS format ONLY (e.g. "00:05:47", "01:23:45")
-- Always include hours (even if zero: "00:")
-- Return ONLY the JSON, nothing else"""
+- Format MUST be HH:MM:SS (always include hours, e.g. "00:05:47")
+- Return ONLY the JSON object, no explanation, no markdown"""
 
-    response = client.models.generate_content(
-        model="gemini-2.0-flash",
-        contents=types.Content(
-            parts=[
-                types.Part(
-                    file_data=types.FileData(
-                        mime_type="video/*",
-                        file_uri=video_url
-                    )
-                ),
-                types.Part(text=prompt)
-            ]
-        ),
-        config=types.GenerateContentConfig(
-            response_mime_type="application/json",
-            response_schema={
-                "type": "object",
-                "properties": {
-                    "timestamp": {
-                        "type": "string",
-                        "description": "Timestamp in HH:MM:SS format"
-                    }
-                },
-                "required": ["timestamp"]
-            }
-        )
+    response = client.chat.completions.create(
+        model="gemini-1.5-pro",
+        messages=[{"role": "user", "content": prompt}],
+        response_format={"type": "json_object"}
     )
 
-    result = json.loads(response.text)
-    timestamp = result.get("timestamp", "00:00:00")
+    raw = response.choices[0].message.content.strip()
+
+    try:
+        result = json.loads(raw)
+        timestamp = result.get("timestamp", "00:00:00")
+    except Exception:
+        match = re.search(r"\d{1,2}:\d{2}:\d{2}", raw)
+        timestamp = match.group(0) if match else "00:00:00"
 
     # Normalize to HH:MM:SS
     parts = timestamp.split(":")
@@ -91,9 +79,9 @@ Rules:
 @app.post("/ask", response_model=AskResponse)
 async def ask(request: AskRequest):
     try:
-        timestamp = find_timestamp_with_gemini(request.video_url, request.topic)
+        timestamp = find_timestamp(request.video_url, request.topic)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Gemini error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
 
     return AskResponse(
         timestamp=timestamp,
