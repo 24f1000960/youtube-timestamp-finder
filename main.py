@@ -46,47 +46,10 @@ def extract_video_id(url: str) -> str:
     raise ValueError(f"Could not extract video ID from URL: {url}")
 
 
-def get_transcript_innertube(video_id: str) -> list:
-    """
-    Use YouTube's Innertube API directly to fetch transcript.
-    This bypasses some IP blocks because it uses internal API endpoints.
-    """
-    # First, get the player response to find caption tracks
-    innertube_url = "https://www.youtube.com/youtubei/v1/player"
-    
-    payload = {
-        "context": {
-            "client": {
-                "hl": "en",
-                "gl": "US",
-                "clientName": "WEB",
-                "clientVersion": "2.20240101.00.00"
-            }
-        },
-        "videoId": video_id
-    }
-    
-    headers = {
-        'Content-Type': 'application/json',
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-    }
-    
-    response = requests.post(innertube_url, json=payload, headers=headers, timeout=15)
-    response.raise_for_status()
-    
-    player_response = response.json()
-    
-    # Check for playability issues
-    playability = player_response.get('playabilityStatus', {})
-    if playability.get('status') == 'ERROR':
-        raise ValueError(f"Video unavailable: {playability.get('reason', 'Unknown error')}")
-    
-    # Get captions
-    captions = player_response.get('captions', {})
-    caption_tracks = captions.get('playerCaptionsTracklistRenderer', {}).get('captionTracks', [])
-    
+def fetch_captions_from_tracks(caption_tracks: list, headers: dict) -> list:
+    """Helper to fetch and parse captions from track list."""
     if not caption_tracks:
-        raise ValueError("No captions available for this video")
+        raise ValueError("No captions available")
     
     # Prefer English, fall back to first available
     caption_url = None
@@ -101,13 +64,12 @@ def get_transcript_innertube(video_id: str) -> list:
     if not caption_url:
         raise ValueError("Could not find caption URL")
     
-    # Add format parameter to get JSON instead of XML
+    # Add format parameter to get JSON
     if '?' in caption_url:
         caption_url += '&fmt=json3'
     else:
         caption_url += '?fmt=json3'
     
-    # Fetch the captions
     caption_response = requests.get(caption_url, headers=headers, timeout=10)
     caption_response.raise_for_status()
     
@@ -128,75 +90,9 @@ def get_transcript_innertube(video_id: str) -> list:
     
     # Fallback: parse XML format
     transcript = []
-    for match in re.finditer(r'<text start="([\d.]+)"[^>]*>([^<]*)</text>', caption_response.text):
-        start = float(match.group(1))
-        text = match.group(2)
-        # Decode HTML entities
-        text = text.replace('&amp;', '&').replace('&lt;', '<').replace('&gt;', '>')
-        text = text.replace('&#39;', "'").replace('&quot;', '"').replace('&nbsp;', ' ')
-        if text.strip():
-            transcript.append({"text": text.strip(), "start": start})
-    
-    if not transcript:
-        raise ValueError("Could not parse captions from response")
-    
-    return transcript
-
-
-def get_transcript_page_scrape(video_id: str) -> list:
-    """
-    Fallback: fetch transcript by parsing YouTube page with consent cookie.
-    """
-    session = requests.Session()
-    
-    # Set consent cookie to bypass EU consent page
-    session.cookies.set('CONSENT', 'YES+cb', domain='.youtube.com')
-    
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Accept-Language': 'en-US,en;q=0.9',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-    }
-    
-    url = f"https://www.youtube.com/watch?v={video_id}"
-    response = session.get(url, headers=headers, timeout=15)
-    response.raise_for_status()
-    
-    # Extract ytInitialPlayerResponse from the page
-    match = re.search(r'ytInitialPlayerResponse\s*=\s*(\{.+?\});', response.text)
-    if not match:
-        raise ValueError("Could not find player response in page")
-    
-    player_response = json.loads(match.group(1))
-    
-    # Get captions track URL
-    captions = player_response.get('captions', {})
-    caption_tracks = captions.get('playerCaptionsTracklistRenderer', {}).get('captionTracks', [])
-    
-    if not caption_tracks:
-        raise ValueError("No captions available for this video")
-    
-    # Prefer English
-    caption_url = None
-    for track in caption_tracks:
-        if track.get('languageCode', '').startswith('en'):
-            caption_url = track.get('baseUrl')
-            break
-    if not caption_url:
-        caption_url = caption_tracks[0].get('baseUrl')
-    
-    if not caption_url:
-        raise ValueError("Could not find caption URL")
-    
-    # Fetch captions
-    caption_response = session.get(caption_url, headers=headers, timeout=10)
-    caption_response.raise_for_status()
-    
-    # Parse XML captions
-    transcript = []
-    for match in re.finditer(r'<text start="([\d.]+)"[^>]*>([^<]*)</text>', caption_response.text):
-        start = float(match.group(1))
-        text = match.group(2)
+    for m in re.finditer(r'<text start="([\d.]+)"[^>]*>([^<]*)</text>', caption_response.text):
+        start = float(m.group(1))
+        text = m.group(2)
         text = text.replace('&amp;', '&').replace('&lt;', '<').replace('&gt;', '>')
         text = text.replace('&#39;', "'").replace('&quot;', '"').replace('&nbsp;', ' ')
         if text.strip():
@@ -208,31 +104,221 @@ def get_transcript_page_scrape(video_id: str) -> list:
     return transcript
 
 
+def get_transcript_innertube_android(video_id: str) -> list:
+    """
+    Use YouTube's Innertube API with Android client.
+    Android client is often less restricted than web.
+    """
+    innertube_url = "https://www.youtube.com/youtubei/v1/player"
+    
+    payload = {
+        "context": {
+            "client": {
+                "hl": "en",
+                "gl": "US",
+                "clientName": "ANDROID",
+                "clientVersion": "19.09.37",
+                "androidSdkVersion": 30,
+                "userAgent": "com.google.android.youtube/19.09.37 (Linux; U; Android 11) gzip"
+            }
+        },
+        "videoId": video_id,
+        "params": "CgIQBg=="  # Request captions
+    }
+    
+    headers = {
+        'Content-Type': 'application/json',
+        'User-Agent': 'com.google.android.youtube/19.09.37 (Linux; U; Android 11) gzip',
+        'X-Youtube-Client-Name': '3',
+        'X-Youtube-Client-Version': '19.09.37',
+    }
+    
+    response = requests.post(innertube_url, json=payload, headers=headers, timeout=15)
+    response.raise_for_status()
+    
+    player_response = response.json()
+    
+    playability = player_response.get('playabilityStatus', {})
+    if playability.get('status') == 'ERROR':
+        raise ValueError(f"Video unavailable: {playability.get('reason', 'Unknown')}")
+    
+    captions = player_response.get('captions', {})
+    caption_tracks = captions.get('playerCaptionsTracklistRenderer', {}).get('captionTracks', [])
+    
+    return fetch_captions_from_tracks(caption_tracks, headers)
+
+
+def get_transcript_innertube_ios(video_id: str) -> list:
+    """
+    Use YouTube's Innertube API with iOS client.
+    """
+    innertube_url = "https://www.youtube.com/youtubei/v1/player"
+    
+    payload = {
+        "context": {
+            "client": {
+                "hl": "en",
+                "gl": "US",
+                "clientName": "IOS",
+                "clientVersion": "19.09.3",
+                "deviceModel": "iPhone14,3",
+                "userAgent": "com.google.ios.youtube/19.09.3 (iPhone14,3; U; CPU iOS 15_6 like Mac OS X)"
+            }
+        },
+        "videoId": video_id,
+        "params": "CgIQBg=="
+    }
+    
+    headers = {
+        'Content-Type': 'application/json',
+        'User-Agent': 'com.google.ios.youtube/19.09.3 (iPhone14,3; U; CPU iOS 15_6 like Mac OS X)',
+        'X-Youtube-Client-Name': '5',
+        'X-Youtube-Client-Version': '19.09.3',
+    }
+    
+    response = requests.post(innertube_url, json=payload, headers=headers, timeout=15)
+    response.raise_for_status()
+    
+    player_response = response.json()
+    
+    playability = player_response.get('playabilityStatus', {})
+    if playability.get('status') == 'ERROR':
+        raise ValueError(f"Video unavailable: {playability.get('reason', 'Unknown')}")
+    
+    captions = player_response.get('captions', {})
+    caption_tracks = captions.get('playerCaptionsTracklistRenderer', {}).get('captionTracks', [])
+    
+    return fetch_captions_from_tracks(caption_tracks, headers)
+
+
+def get_transcript_innertube_tv(video_id: str) -> list:
+    """
+    Use YouTube's Innertube API with TV embedded client.
+    """
+    innertube_url = "https://www.youtube.com/youtubei/v1/player"
+    
+    payload = {
+        "context": {
+            "client": {
+                "hl": "en",
+                "gl": "US",
+                "clientName": "TVHTML5_SIMPLY_EMBEDDED_PLAYER",
+                "clientVersion": "2.0"
+            }
+        },
+        "videoId": video_id
+    }
+    
+    headers = {
+        'Content-Type': 'application/json',
+        'User-Agent': 'Mozilla/5.0 (SMART-TV; Linux; Tizen 5.0) AppleWebKit/537.36',
+    }
+    
+    response = requests.post(innertube_url, json=payload, headers=headers, timeout=15)
+    response.raise_for_status()
+    
+    player_response = response.json()
+    
+    playability = player_response.get('playabilityStatus', {})
+    if playability.get('status') == 'ERROR':
+        raise ValueError(f"Video unavailable: {playability.get('reason', 'Unknown')}")
+    
+    captions = player_response.get('captions', {})
+    caption_tracks = captions.get('playerCaptionsTracklistRenderer', {}).get('captionTracks', [])
+    
+    return fetch_captions_from_tracks(caption_tracks, headers)
+
+
+def get_transcript_third_party(video_id: str) -> list:
+    """
+    Use third-party transcript API as final fallback.
+    Tries multiple free services.
+    """
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'Accept': 'application/json',
+    }
+    
+    # Try kome.ai (free, no auth required for basic usage)
+    try:
+        url = f"https://kome.ai/api/tools/youtube-transcript?video_id={video_id}"
+        response = requests.get(url, headers=headers, timeout=15)
+        if response.status_code == 200:
+            data = response.json()
+            transcript = []
+            # Parse kome.ai response format
+            if isinstance(data, list):
+                for item in data:
+                    if 'text' in item and 'start' in item:
+                        transcript.append({"text": item['text'], "start": float(item['start'])})
+            elif 'transcript' in data:
+                for item in data['transcript']:
+                    if 'text' in item:
+                        transcript.append({"text": item['text'], "start": float(item.get('start', 0))})
+            if transcript:
+                return transcript
+    except Exception:
+        pass
+    
+    # Try youtubetranscript.com
+    try:
+        url = f"https://youtubetranscript.com/?server_vid2={video_id}"
+        response = requests.get(url, headers=headers, timeout=15)
+        if response.status_code == 200:
+            # Parse XML response
+            transcript = []
+            for m in re.finditer(r'<text start="([\d.]+)"[^>]*>([^<]*)</text>', response.text):
+                start = float(m.group(1))
+                text = m.group(2)
+                text = text.replace('&amp;', '&').replace('&lt;', '<').replace('&gt;', '>')
+                text = text.replace('&#39;', "'").replace('&quot;', '"')
+                if text.strip():
+                    transcript.append({"text": text.strip(), "start": start})
+            if transcript:
+                return transcript
+    except Exception:
+        pass
+    
+    raise ValueError("Third-party transcript APIs failed")
+
+
 def get_transcript(video_id: str) -> list:
     """
     Try multiple methods to fetch transcript, with fallbacks.
     """
     errors = []
     
-    # Method 1: youtube-transcript-api (most reliable when not blocked)
+    # Method 1: youtube-transcript-api
     try:
         ytt = YouTubeTranscriptApi()
         fetched = ytt.fetch(video_id)
         return [{"text": s.text, "start": s.start} for s in fetched]
     except Exception as e:
-        errors.append(f"youtube-transcript-api: {str(e)}")
+        errors.append(f"yt-api: {str(e)[:50]}")
     
-    # Method 2: Innertube API (bypasses some blocks)
+    # Method 2: Android Innertube (often less restricted)
     try:
-        return get_transcript_innertube(video_id)
+        return get_transcript_innertube_android(video_id)
     except Exception as e:
-        errors.append(f"innertube: {str(e)}")
+        errors.append(f"android: {str(e)[:50]}")
     
-    # Method 3: Page scrape with consent cookie
+    # Method 3: iOS Innertube
     try:
-        return get_transcript_page_scrape(video_id)
+        return get_transcript_innertube_ios(video_id)
     except Exception as e:
-        errors.append(f"page_scrape: {str(e)}")
+        errors.append(f"ios: {str(e)[:50]}")
+    
+    # Method 4: TV Innertube
+    try:
+        return get_transcript_innertube_tv(video_id)
+    except Exception as e:
+        errors.append(f"tv: {str(e)[:50]}")
+    
+    # Method 5: Third-party APIs
+    try:
+        return get_transcript_third_party(video_id)
+    except Exception as e:
+        errors.append(f"3rd-party: {str(e)[:50]}")
     
     # All methods failed
     raise ValueError(f"All transcript methods failed: {'; '.join(errors)}")
