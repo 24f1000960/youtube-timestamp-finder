@@ -49,8 +49,8 @@ def get_transcript(video_id: str) -> list:
     # New API (v1.0+): instantiate the class, then call .fetch()
     ytt = YouTubeTranscriptApi()
     fetched = ytt.fetch(video_id)
-    # fetched is a FetchedTranscript object — iterate its snippets
-    return [{"text": s.text, "start": s.start} for s in fetched.snippets]
+    # fetched is a FetchedTranscript object — iterate directly (not .snippets)
+    return [{"text": s.text, "start": s.start} for s in fetched]
 
 
 def seconds_to_hhmmss(seconds: float) -> str:
