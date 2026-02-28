@@ -6,6 +6,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from openai import OpenAI
 from dotenv import load_dotenv
+from youtube_transcript_api import YouTubeTranscriptApi
+from youtube_transcript_api.proxies import WebshareProxyConfig
 
 load_dotenv()
 
@@ -31,7 +33,40 @@ class AskResponse(BaseModel):
     topic: str
 
 
-def find_timestamp(video_url: str, topic: str) -> str:
+def extract_video_id(url: str) -> str:
+    """Extract YouTube video ID from various URL formats."""
+    patterns = [
+        r"(?:v=|\/)([0-9A-Za-z_-]{11}).*",
+        r"youtu\.be\/([0-9A-Za-z_-]{11})",
+        r"embed\/([0-9A-Za-z_-]{11})",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, url)
+        if match:
+            return match.group(1)
+    raise ValueError(f"Could not extract video ID from URL: {url}")
+
+
+def get_transcript(video_id: str) -> list:
+    """Fetch transcript using youtube_transcript_api."""
+    try:
+        transcript = YouTubeTranscriptApi.get_transcript(video_id)
+        return transcript
+    except Exception as e:
+        raise RuntimeError(f"Transcript error: {str(e)}")
+
+
+def seconds_to_hhmmss(seconds: float) -> str:
+    """Convert seconds to HH:MM:SS format."""
+    seconds = int(seconds)
+    h = seconds // 3600
+    m = (seconds % 3600) // 60
+    s = seconds % 60
+    return f"{h:02d}:{m:02d}:{s:02d}"
+
+
+def find_timestamp_with_llm(transcript: list, topic: str, video_url: str) -> str:
+    """Send transcript to LLM and ask it to find the timestamp."""
     token = os.environ.get("AIPIPE_TOKEN")
     if not token:
         raise RuntimeError("AIPIPE_TOKEN environment variable is not set")
@@ -41,16 +76,33 @@ def find_timestamp(video_url: str, topic: str) -> str:
         base_url="https://aipipe.org/openrouter/v1"
     )
 
-    prompt = f"""You are analyzing a YouTube video at this URL: {video_url}
+    # Build transcript text with timestamps — limit to ~12000 chars to stay within context
+    transcript_lines = []
+    for entry in transcript:
+        ts = seconds_to_hhmmss(entry["start"])
+        transcript_lines.append(f"[{ts}] {entry['text']}")
 
-Find the FIRST moment in the video where the topic or phrase "{topic}" is spoken or discussed.
+    transcript_text = "\n".join(transcript_lines)
 
-Respond ONLY with a valid JSON object like this:
-{{"timestamp": "00:05:47"}}
+    # Trim if too long
+    if len(transcript_text) > 12000:
+        transcript_text = transcript_text[:12000] + "\n... (transcript truncated)"
+
+    prompt = f"""Below is a timestamped transcript from a YouTube video.
+
+Find the FIRST moment where this topic is spoken or discussed:
+"{topic}"
+
+TRANSCRIPT:
+{transcript_text}
+
+Respond ONLY with a valid JSON object:
+{{"timestamp": "HH:MM:SS"}}
 
 Rules:
-- Format MUST be HH:MM:SS (always include hours, e.g. "00:05:47")
-- Return ONLY the JSON object, no explanation, no markdown"""
+- Return the EXACT timestamp from the transcript where the topic FIRST appears
+- Format MUST be HH:MM:SS (e.g. "00:05:47", "01:23:45")
+- Return ONLY the JSON, no explanation"""
 
     response = client.chat.completions.create(
         model="google/gemini-2.5-pro-preview-03-25",
@@ -82,9 +134,19 @@ Rules:
 @app.post("/ask", response_model=AskResponse)
 async def ask(request: AskRequest):
     try:
-        timestamp = find_timestamp(request.video_url, request.topic)
+        video_id = extract_video_id(request.video_url)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
+        raise HTTPException(status_code=400, detail=f"Invalid video URL: {str(e)}")
+
+    try:
+        transcript = get_transcript(video_id)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Transcript error: {str(e)}")
+
+    try:
+        timestamp = find_timestamp_with_llm(transcript, request.topic, request.video_url)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"LLM error: {str(e)}")
 
     return AskResponse(
         timestamp=timestamp,
