@@ -32,14 +32,14 @@ class AskResponse(BaseModel):
 
 
 def find_timestamp(video_url: str, topic: str) -> str:
-    # Create client inside the function — missing env var = 500 error, not startup crash
     token = os.environ.get("AIPIPE_TOKEN")
     if not token:
-        raise RuntimeError("AIPIPE_TOKEN environment variable is not set on Render")
+        raise RuntimeError("AIPIPE_TOKEN environment variable is not set")
 
+    # Use OpenRouter route — correct base URL for Gemini via AIpipe
     client = OpenAI(
         api_key=token,
-        base_url="https://aipipe.org/openai/v1"
+        base_url="https://aipipe.org/openrouter/v1"
     )
 
     prompt = f"""You are analyzing a YouTube video at this URL: {video_url}
@@ -54,7 +54,7 @@ Rules:
 - Return ONLY the JSON object, no explanation, no markdown"""
 
     response = client.chat.completions.create(
-        model="gemini-1.5-pro",
+        model="google/gemini-1.5-pro",
         messages=[{"role": "user", "content": prompt}],
         response_format={"type": "json_object"}
     )
