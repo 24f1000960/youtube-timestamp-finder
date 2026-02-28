@@ -7,7 +7,6 @@ from pydantic import BaseModel
 from openai import OpenAI
 from dotenv import load_dotenv
 from youtube_transcript_api import YouTubeTranscriptApi
-from youtube_transcript_api.proxies import WebshareProxyConfig
 
 load_dotenv()
 
@@ -34,7 +33,6 @@ class AskResponse(BaseModel):
 
 
 def extract_video_id(url: str) -> str:
-    """Extract YouTube video ID from various URL formats."""
     patterns = [
         r"(?:v=|\/)([0-9A-Za-z_-]{11}).*",
         r"youtu\.be\/([0-9A-Za-z_-]{11})",
@@ -48,16 +46,14 @@ def extract_video_id(url: str) -> str:
 
 
 def get_transcript(video_id: str) -> list:
-    """Fetch transcript using youtube_transcript_api."""
-    try:
-        transcript = YouTubeTranscriptApi.get_transcript(video_id)
-        return transcript
-    except Exception as e:
-        raise RuntimeError(f"Transcript error: {str(e)}")
+    # New API (v1.0+): instantiate the class, then call .fetch()
+    ytt = YouTubeTranscriptApi()
+    fetched = ytt.fetch(video_id)
+    # fetched is a FetchedTranscript object — iterate its snippets
+    return [{"text": s.text, "start": s.start} for s in fetched.snippets]
 
 
 def seconds_to_hhmmss(seconds: float) -> str:
-    """Convert seconds to HH:MM:SS format."""
     seconds = int(seconds)
     h = seconds // 3600
     m = (seconds % 3600) // 60
@@ -65,8 +61,7 @@ def seconds_to_hhmmss(seconds: float) -> str:
     return f"{h:02d}:{m:02d}:{s:02d}"
 
 
-def find_timestamp_with_llm(transcript: list, topic: str, video_url: str) -> str:
-    """Send transcript to LLM and ask it to find the timestamp."""
+def find_timestamp_with_llm(transcript: list, topic: str) -> str:
     token = os.environ.get("AIPIPE_TOKEN")
     if not token:
         raise RuntimeError("AIPIPE_TOKEN environment variable is not set")
@@ -76,7 +71,7 @@ def find_timestamp_with_llm(transcript: list, topic: str, video_url: str) -> str
         base_url="https://aipipe.org/openrouter/v1"
     )
 
-    # Build transcript text with timestamps — limit to ~12000 chars to stay within context
+    # Build timestamped transcript text
     transcript_lines = []
     for entry in transcript:
         ts = seconds_to_hhmmss(entry["start"])
@@ -84,13 +79,13 @@ def find_timestamp_with_llm(transcript: list, topic: str, video_url: str) -> str
 
     transcript_text = "\n".join(transcript_lines)
 
-    # Trim if too long
+    # Trim if too long — keep first 12000 chars
     if len(transcript_text) > 12000:
-        transcript_text = transcript_text[:12000] + "\n... (transcript truncated)"
+        transcript_text = transcript_text[:12000] + "\n... (truncated)"
 
     prompt = f"""Below is a timestamped transcript from a YouTube video.
 
-Find the FIRST moment where this topic is spoken or discussed:
+Find the FIRST moment where this topic or phrase is spoken or discussed:
 "{topic}"
 
 TRANSCRIPT:
@@ -144,7 +139,7 @@ async def ask(request: AskRequest):
         raise HTTPException(status_code=400, detail=f"Transcript error: {str(e)}")
 
     try:
-        timestamp = find_timestamp_with_llm(transcript, request.topic, request.video_url)
+        timestamp = find_timestamp_with_llm(transcript, request.topic)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"LLM error: {str(e)}")
 
