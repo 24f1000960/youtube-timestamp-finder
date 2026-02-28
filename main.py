@@ -10,7 +10,6 @@ from google import genai
 from google.genai import types
 from dotenv import load_dotenv
 
-# Load environment variables from .env file
 load_dotenv()
 
 app = FastAPI()
@@ -23,7 +22,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Create a single Gemini client using the API key from .env
 client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
 
 
@@ -43,9 +41,11 @@ def download_audio(video_url: str, output_path: str) -> str:
     command = [
         "yt-dlp",
         "--no-playlist",
-        "-x",                        # Extract audio only
-        "--audio-format", "mp3",     # Convert to mp3
-        "--audio-quality", "0",      # Best quality
+        "-x",
+        "--audio-format", "mp3",
+        "--audio-quality", "0",
+        "--extractor-args", "youtube:player_client=web",
+        "--no-check-certificates",
         "-o", output_path,
         video_url
     ]
@@ -62,8 +62,7 @@ def upload_and_wait(file_path: str):
         config=types.UploadFileConfig(mime_type="audio/mpeg")
     )
 
-    # Poll until the file is ACTIVE (ready to use)
-    max_wait = 120  # seconds
+    max_wait = 120
     waited = 0
     while uploaded.state.name != "ACTIVE":
         if waited > max_wait:
@@ -111,10 +110,8 @@ Rules:
     result = json.loads(response.text)
     timestamp = result.get("timestamp", "00:00:00")
 
-    # Validate and fix format — must be HH:MM:SS
     parts = timestamp.split(":")
     if len(parts) == 2:
-        # MM:SS -> add 00: prefix
         timestamp = f"00:{parts[0].zfill(2)}:{parts[1].zfill(2)}"
     elif len(parts) == 3:
         timestamp = f"{parts[0].zfill(2)}:{parts[1].zfill(2)}:{parts[2].zfill(2)}"
@@ -130,17 +127,14 @@ async def ask(request: AskRequest):
     uploaded_file = None
 
     try:
-        # Step 1: Create a temp file path for the audio
         with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp:
             audio_path = tmp.name
 
-        # Step 2: Download audio from YouTube
         try:
             download_audio(request.video_url, audio_path)
         except Exception as e:
             raise HTTPException(status_code=400, detail=f"Audio download error: {str(e)}")
 
-        # Check the file actually exists and has content
         if not os.path.exists(audio_path) or os.path.getsize(audio_path) == 0:
             mp3_path = audio_path.replace(".mp3", "") + ".mp3"
             if os.path.exists(mp3_path) and os.path.getsize(mp3_path) > 0:
@@ -148,13 +142,11 @@ async def ask(request: AskRequest):
             else:
                 raise HTTPException(status_code=400, detail="Audio download produced empty file")
 
-        # Step 3: Upload to Gemini Files API
         try:
             uploaded_file = upload_and_wait(audio_path)
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Gemini upload error: {str(e)}")
 
-        # Step 4: Ask Gemini to find the timestamp
         try:
             timestamp = find_timestamp_with_gemini(uploaded_file, request.topic)
         except Exception as e:
@@ -167,13 +159,11 @@ async def ask(request: AskRequest):
         )
 
     finally:
-        # Step 5: Cleanup — delete temp audio file
         if audio_path and os.path.exists(audio_path):
             try:
                 os.unlink(audio_path)
             except Exception:
                 pass
-        # Delete from Gemini Files too (saves quota)
         if uploaded_file:
             try:
                 client.files.delete(name=uploaded_file.name)
