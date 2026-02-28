@@ -46,24 +46,124 @@ def extract_video_id(url: str) -> str:
     raise ValueError(f"Could not extract video ID from URL: {url}")
 
 
-def get_transcript_fallback(video_id: str) -> list:
+def get_transcript_innertube(video_id: str) -> list:
     """
-    Fallback: fetch transcript by parsing YouTube's player response directly.
-    This uses different endpoints that may bypass IP blocks.
+    Use YouTube's Innertube API directly to fetch transcript.
+    This bypasses some IP blocks because it uses internal API endpoints.
     """
+    # First, get the player response to find caption tracks
+    innertube_url = "https://www.youtube.com/youtubei/v1/player"
+    
+    payload = {
+        "context": {
+            "client": {
+                "hl": "en",
+                "gl": "US",
+                "clientName": "WEB",
+                "clientVersion": "2.20240101.00.00"
+            }
+        },
+        "videoId": video_id
+    }
+    
+    headers = {
+        'Content-Type': 'application/json',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    }
+    
+    response = requests.post(innertube_url, json=payload, headers=headers, timeout=15)
+    response.raise_for_status()
+    
+    player_response = response.json()
+    
+    # Check for playability issues
+    playability = player_response.get('playabilityStatus', {})
+    if playability.get('status') == 'ERROR':
+        raise ValueError(f"Video unavailable: {playability.get('reason', 'Unknown error')}")
+    
+    # Get captions
+    captions = player_response.get('captions', {})
+    caption_tracks = captions.get('playerCaptionsTracklistRenderer', {}).get('captionTracks', [])
+    
+    if not caption_tracks:
+        raise ValueError("No captions available for this video")
+    
+    # Prefer English, fall back to first available
+    caption_url = None
+    for track in caption_tracks:
+        lang = track.get('languageCode', '')
+        if lang.startswith('en'):
+            caption_url = track.get('baseUrl')
+            break
+    if not caption_url:
+        caption_url = caption_tracks[0].get('baseUrl')
+    
+    if not caption_url:
+        raise ValueError("Could not find caption URL")
+    
+    # Add format parameter to get JSON instead of XML
+    if '?' in caption_url:
+        caption_url += '&fmt=json3'
+    else:
+        caption_url += '?fmt=json3'
+    
+    # Fetch the captions
+    caption_response = requests.get(caption_url, headers=headers, timeout=10)
+    caption_response.raise_for_status()
+    
+    # Parse JSON format
+    try:
+        caption_data = caption_response.json()
+        transcript = []
+        for event in caption_data.get('events', []):
+            if 'segs' in event:
+                start = event.get('tStartMs', 0) / 1000.0
+                text = ''.join(seg.get('utf8', '') for seg in event['segs'])
+                if text.strip():
+                    transcript.append({"text": text.strip(), "start": start})
+        if transcript:
+            return transcript
+    except json.JSONDecodeError:
+        pass
+    
+    # Fallback: parse XML format
+    transcript = []
+    for match in re.finditer(r'<text start="([\d.]+)"[^>]*>([^<]*)</text>', caption_response.text):
+        start = float(match.group(1))
+        text = match.group(2)
+        # Decode HTML entities
+        text = text.replace('&amp;', '&').replace('&lt;', '<').replace('&gt;', '>')
+        text = text.replace('&#39;', "'").replace('&quot;', '"').replace('&nbsp;', ' ')
+        if text.strip():
+            transcript.append({"text": text.strip(), "start": start})
+    
+    if not transcript:
+        raise ValueError("Could not parse captions from response")
+    
+    return transcript
+
+
+def get_transcript_page_scrape(video_id: str) -> list:
+    """
+    Fallback: fetch transcript by parsing YouTube page with consent cookie.
+    """
+    session = requests.Session()
+    
+    # Set consent cookie to bypass EU consent page
+    session.cookies.set('CONSENT', 'YES+cb', domain='.youtube.com')
+    
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
         'Accept-Language': 'en-US,en;q=0.9',
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
     }
     
-    # Fetch the video page
     url = f"https://www.youtube.com/watch?v={video_id}"
-    response = requests.get(url, headers=headers, timeout=10)
+    response = session.get(url, headers=headers, timeout=15)
     response.raise_for_status()
     
     # Extract ytInitialPlayerResponse from the page
-    match = re.search(r'ytInitialPlayerResponse\s*=\s*({.+?});', response.text)
+    match = re.search(r'ytInitialPlayerResponse\s*=\s*(\{.+?\});', response.text)
     if not match:
         raise ValueError("Could not find player response in page")
     
@@ -76,10 +176,10 @@ def get_transcript_fallback(video_id: str) -> list:
     if not caption_tracks:
         raise ValueError("No captions available for this video")
     
-    # Prefer English, fall back to first available
+    # Prefer English
     caption_url = None
     for track in caption_tracks:
-        if 'en' in track.get('languageCode', ''):
+        if track.get('languageCode', '').startswith('en'):
             caption_url = track.get('baseUrl')
             break
     if not caption_url:
@@ -88,19 +188,19 @@ def get_transcript_fallback(video_id: str) -> list:
     if not caption_url:
         raise ValueError("Could not find caption URL")
     
-    # Fetch the captions (returns XML)
-    caption_response = requests.get(caption_url, headers=headers, timeout=10)
+    # Fetch captions
+    caption_response = session.get(caption_url, headers=headers, timeout=10)
     caption_response.raise_for_status()
     
     # Parse XML captions
     transcript = []
-    for match in re.finditer(r'<text start="([\d.]+)"[^>]*>([^<]+)</text>', caption_response.text):
+    for match in re.finditer(r'<text start="([\d.]+)"[^>]*>([^<]*)</text>', caption_response.text):
         start = float(match.group(1))
         text = match.group(2)
-        # Decode HTML entities
         text = text.replace('&amp;', '&').replace('&lt;', '<').replace('&gt;', '>')
-        text = text.replace('&#39;', "'").replace('&quot;', '"')
-        transcript.append({"text": text, "start": start})
+        text = text.replace('&#39;', "'").replace('&quot;', '"').replace('&nbsp;', ' ')
+        if text.strip():
+            transcript.append({"text": text.strip(), "start": start})
     
     if not transcript:
         raise ValueError("Could not parse captions")
@@ -110,23 +210,32 @@ def get_transcript_fallback(video_id: str) -> list:
 
 def get_transcript(video_id: str) -> list:
     """
-    Try youtube-transcript-api first, fall back to direct HTTP parsing.
+    Try multiple methods to fetch transcript, with fallbacks.
     """
-    # Method 1: youtube-transcript-api (faster, cleaner)
+    errors = []
+    
+    # Method 1: youtube-transcript-api (most reliable when not blocked)
     try:
         ytt = YouTubeTranscriptApi()
         fetched = ytt.fetch(video_id)
         return [{"text": s.text, "start": s.start} for s in fetched]
     except Exception as e:
-        error_msg = str(e).lower()
-        # If it's an IP block or bot detection, try fallback
-        if "blocking" in error_msg or "bot" in error_msg or "ip" in error_msg:
-            pass  # Continue to fallback
-        else:
-            raise  # Re-raise other errors
+        errors.append(f"youtube-transcript-api: {str(e)}")
     
-    # Method 2: Direct HTTP request fallback
-    return get_transcript_fallback(video_id)
+    # Method 2: Innertube API (bypasses some blocks)
+    try:
+        return get_transcript_innertube(video_id)
+    except Exception as e:
+        errors.append(f"innertube: {str(e)}")
+    
+    # Method 3: Page scrape with consent cookie
+    try:
+        return get_transcript_page_scrape(video_id)
+    except Exception as e:
+        errors.append(f"page_scrape: {str(e)}")
+    
+    # All methods failed
+    raise ValueError(f"All transcript methods failed: {'; '.join(errors)}")
 
 
 def seconds_to_hhmmss(seconds: float) -> str:
