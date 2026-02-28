@@ -36,7 +36,6 @@ def find_timestamp(video_url: str, topic: str) -> str:
     if not token:
         raise RuntimeError("AIPIPE_TOKEN environment variable is not set")
 
-    # Use OpenRouter route — correct base URL for Gemini via AIpipe
     client = OpenAI(
         api_key=token,
         base_url="https://aipipe.org/openrouter/v1"
@@ -54,7 +53,7 @@ Rules:
 - Return ONLY the JSON object, no explanation, no markdown"""
 
     response = client.chat.completions.create(
-        model="google/gemini-1.5-pro",
+        model="google/gemini-2.5-pro-preview-03-25",
         messages=[{"role": "user", "content": prompt}],
         response_format={"type": "json_object"}
     )
